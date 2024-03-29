@@ -1,0 +1,11 @@
+If using this code for research or industrial purposes, please cite:
+Emilio Martinez-Paneda, On the finite element implementation of 
+functionally graded materials, Materials 12(2): 287 (2019)
+
+Temperature.inp showcases the graded element implementation using the
+temperature as an auxiliary field. The temperature variation is defined
+through a predefined field and an analytical field: dexp(2.07944154168*x)
+
+USDFLD.inp showcases the graded element implementation by means of a
+user element subroutine (USDFLD.for) to the material gradient at the
+Gauss integration points.
