@@ -5,13 +5,6 @@
 
 module common_block
     implicit none
-    ! common_coords, gradient of the hydrostatic stress, and the hydrostatic stress
-    ! The element type is CPE8HT, which is a 2D 8-node hybrid stress element
-    
-    ! num_dimension = 2
-    ! total_integration_point = 9
-    ! total_elements = 50000 ! Just a very large number. The actual number of elements is
-                           ! in the .inp file (how many lines under *Element)
                            
     real*8 :: common_coords(50000, 4, 2)
     real*8 :: grad_sigma_hydrostatic(50000, 4, 2)
@@ -129,30 +122,28 @@ subroutine UMAT(stress,statev,ddsdde,sse,spd,scd, &
        stran(ntens),dstran(ntens),time(2),predef(1),dpred(1), &
        props(nprops),coords(3),drot(3,3),dfgrd0(3,3),dfgrd1(3,3)
 !
-    real E, nu, lambda, mu
+    real E, nu, sigma_0, n_hardening, lambda, mu, PEEQ, von_Mises_stress, hydrostatic_stress 
+    real sigma_Y, sigma_H0, dPEEQ, E_tangent, effective_mu, effective_lambda, effective_hard
 
     dimension eps_elastic(ntens),eps_plastic(ntens),flow_stress(ntens), &
          old_stress(ntens), old_eps_platic(ntens)
-        
+
+
     real, parameter :: toler = 1.d-6
     real, parameter :: newton = 50
 
-! Initialize material properties
+    ! Initialize material properties
     
-    dPEEQ = 0.d0
     E = props(1)           ! Young's modulus
     nu = props(2)          ! Poisson's ratio
     sigma_0 = props(3)     ! Initial yield strength in the absence of hydrogen (MPa)
-    n_hardening = props(4) ! hardening exponent not affected by Hydrogen
+    n_hardening = props(4) ! Strain hardening exponent not affected by Hydrogen
                            ! in paper it is 5, but it is already inversed here, so it is 0.2
+    dPEEQ = 0.d0           ! Equivalent plastic strain increment
 
-    call rotsig(statev(1), drot, eps_elastic, 2, ndi, nshr)
-    call rotsig(statev(ntens+1), drot, eps_plastic, 2, ndi, nshr)
-    
-    PEEQ = statev(9)
+
     old_stress = stress
     old_eps_platic = eps_plastic
-
 
 ! UMAT and UMATHT are integration point level, 
 ! which loops over all the integration points over all elements
@@ -172,11 +163,10 @@ subroutine UMAT(stress,statev,ddsdde,sse,spd,scd, &
         call calculate_grad_sigma_hydrostatic_CPE8RT(noel)
     end if     
       
-
 ! Lame's parameters
-    mu = E/(2.0d0 * (1.0 + nu))
-    lambda = E*nu/((1.0 + nu) * (1.0 - 2.0 * nu))
-
+    mu = E/(2.0d0 * (1.0 + nu))  ! Shear modulus
+    !lambda = E*nu/((1.0 + nu) * (1.0 - 2.0 * nu)) ! Lame's constant
+    lambda = (E/(1.d0-2.d0*nu)-2.d0*mu)/3.d0 ! Lame's constant
 ! Stiffness matrix
     
     ! initialize as 0
@@ -194,6 +184,11 @@ subroutine UMAT(stress,statev,ddsdde,sse,spd,scd, &
         ddsdde(i,i) = mu
     end do 
 
+    call rotsig(statev(1), drot, eps_elastic, 2, ndi, nshr)
+    call rotsig(statev(ntens+1), drot, eps_plastic, 2, ndi, nshr)
+    
+    PEEQ = statev(9)
+    
 ! Stress increment evaluation
     stress = stress + matmul(ddsdde,dstran) 
 
@@ -214,70 +209,80 @@ subroutine UMAT(stress,statev,ddsdde,sse,spd,scd, &
     ! PSI_Cbar_L = statev(13)
 
     ! First extreme case: PSI_Cbar_L = 1.0
-    PSI_Cbar_L = 0.2
+    ! PSI_Cbar_L = 1.0
+    
     ! Second extreme case: PSI_Cbar_L = 0.2 (xi)
     ! PSI_Cbar_L = 0.2
     
-    !if (time(1) > 0) then
-    !    PSI_Cbar_L = statev(13)
-    !else
-    !    PSI_Cbar_L = 0.88
-    !end if
+    if (time(1) > 0) then
+        PSI_Cbar_L = statev(13)
+    else
+        PSI_Cbar_L = 0.52
+    end if
 
     sigma_H0 = PSI_Cbar_L * sigma_0 ! constant within this UMAT
+    
     ! From now, sigma_H0 is the yield strength in the presence of hydrogen
 
     ! Equation 33: We assume that the current
     ! yield strength, sigma_Y, is a function of the equivalent plastic strain PEEQ
     ! and Cbar_L according to the relationship
-    
-    PEEQ_0 = sigma_H0 / E
-    sigma_Y = sigma_H0 * ((1 + PEEQ/PEEQ_0) ** n_hardening)
-    !sigma_Y_noH = sigma_0 * ((1 + E * PEEQ/sigma_0) ** n_hardening)
+  
+    sigma_Y = sigma_H0 * ((1 + E * PEEQ/sigma_H0) ** n_hardening)
 
-!   Determine if active yielding
+    ! Determine if active yielding
     if (von_Mises_stress > (1.d0 + toler) * sigma_Y) then
 
-!       Calculate the flow_stress direction
+        ! Calculate the flow_stress direction
         hydrostatic_stress = (stress(1) + stress(2) + stress(3))/3.d0
-        flow_stress(1:3) = (stress(1:3) - hydrostatic_stress)/von_Mises_stress
+        flow_stress(1:ndi) = (stress(1:ndi) - hydrostatic_stress)/von_Mises_stress
         flow_stress(ndi+1:ntens) = stress(ndi+1:ntens)/von_Mises_stress
-       
-!       Solve for von_Mises_stress and dPEEQ using Newton's method
-!       Tangent Modulus Derivation, Et = d_sigma_Y_d_PEEQ (derivative of sigma_Y w.r.t PEEQ)
-        ! E_tangent = E * n_hardening * (1.d0 + E * PEEQ/sigma_H0) ** ((n_hardening) - 1)
-        E_tangent = E * n_hardening * (1.d0 + PEEQ/PEEQ_0) ** (n_hardening - 1)
         
+        ! Newton-Raphson iterative solution
+        ! the Newton-Raphson method aims to solve the following nonlinear equation:
+        ! von_Mises_stress - (3.d0 * mu * dPEEQ) - sigma_Y = 0
+        ! Newton-Raphson is an iterative root-finding method used to solve equations of the form 
+        ! f(x)=0. It uses the derivative of the function f(x) to iteratively converge to a root. 
+        ! The method requires an initial guess and proceeds as follows:
+
+        ! x_{n+1} = x_n - f(x_n)/f'(x_n)
+        ! where x_n is the current guess and x_{n+1} is the next guess.
+        ! f(x_n) is the function evaluated at the current estimate.
+        ! f'(x_n) is the derivative of the function evaluated at the current estimate.
+
+        ! initial guess for dPEEQ
         dPEEQ = 0.d0
-!       Newton-Raphson iterative solution
+    
+        ! Tangent Modulus Derivation
+        ! It represents the slope of the stress-strain curve at any point, particularly in the plastic region of the curve.
+        ! It is the derivative of the yield stress with respect to the plastic strain (derivative of sigma_Y w.r.t PEEQ)
+        E_tangent = E * n_hardening * (1.d0 + E * PEEQ/sigma_H0) ** (n_hardening - 1)
+        
         do k_newton = 1, newton
-            rhs = von_Mises_stress - (3.d0 * mu) * dPEEQ - sigma_Y
+            rhs = von_Mises_stress - (3.d0 * mu * dPEEQ) - sigma_Y
             dPEEQ = dPEEQ + rhs / ((3.d0 * mu) + E_tangent)
 
-            !sigma_Y = sigma_H0 * (1.d0 + E * (PEEQ + dPEEQ)/sigma_H0) ** n_hardening
-            !E_tangent = E * n_hardening * (1.d0 + E * (PEEQ + dPEEQ)/sigma_H0) ** (n_hardening-1)
-
-            sigma_Y = sigma_H0 * (1.d0 + (PEEQ + dPEEQ)/PEEQ_0) ** n_hardening
-            E_tangent = E * n_hardening * (1.d0 + (PEEQ + dPEEQ)/PEEQ_0) ** (n_hardening-1)
-
-            !if (abs(rhs) < toler * sigma_H0) exit
+            sigma_Y = sigma_H0 * (1.d0 + E * (PEEQ + dPEEQ)/sigma_H0) ** n_hardening
+            E_tangent = E * n_hardening * (1.d0 + E * (PEEQ + dPEEQ)/sigma_H0) ** (n_hardening-1)
+            
             if (abs(rhs) < toler * sigma_H0) exit
         end do
 
         if (k_newton == newton) write(7,*)'WARNING: plasticity loop failed'
 
-!       Update stresses and strains
+        ! Update stresses and strains
         stress(1:ndi) = flow_stress(1:ndi) * sigma_Y + hydrostatic_stress
 
-!       Update the elastic and plastic strains
-        eps_elastic(1:ndi) = eps_elastic(1:ndi) - 3.d0/2.d0 * flow_stress(1:ndi) * dPEEQ
+        ! Update the elastic and plastic strains
         eps_plastic(1:ndi) = eps_plastic(1:ndi) + 3.d0/2.d0 * flow_stress(1:ndi) * dPEEQ
-
+        eps_elastic(1:ndi) = eps_elastic(1:ndi) - 3.d0/2.d0 * flow_stress(1:ndi) * dPEEQ
+        
         stress(ndi+1:ntens) = flow_stress(ndi+1:ntens) * sigma_Y
 
-        eps_elastic(ndi+1:ntens) = eps_elastic(ndi+1:ntens) - 3.d0 * flow_stress(ndi+1:ntens) * dPEEQ
         eps_plastic(ndi+1:ntens) = eps_plastic(ndi+1:ntens) + 3.d0 * flow_stress(ndi+1:ntens) * dPEEQ
+        eps_elastic(ndi+1:ntens) = eps_elastic(ndi+1:ntens) - 3.d0 * flow_stress(ndi+1:ntens) * dPEEQ
 
+        ! Finally, we update the equivalent plastic strain
         PEEQ = PEEQ + dPEEQ
 
 !       Calculate the plastic strain energy density
@@ -356,7 +361,7 @@ subroutine UMATHT(u,dudt,dudg,flux,dfdt,dfdg, &
     double precision :: K ! Arhenius reaction rate constant
 
     double precision :: NA = 6.023D23 ! Avogadro's number (1/mol)
-    double precision :: N_L = 9.24D28 ! Number of solvent atoms (Ni) per unit volume (mol/m^3)
+    double precision :: N_L = 9.24D28 ! Number of solvent atoms (Ni) per unit volume (1/m^3)
     double precision :: beta = 6.0D0 ! Number of interstitial sites per solvent (Ni) atom
     
     double precision :: a_lattice = 2.86D-10 ! Lattice parameter (m)
@@ -384,7 +389,7 @@ subroutine UMATHT(u,dudt,dudg,flux,dfdt,dfdg, &
     Cbar_L = temp + dtemp
 
     ! Equation 15: Arhenius reaction rate constant 
-    K = exp( -WB / (R * T)) ! constant
+    K = exp( -WB / (R * T)) ! constant around 1361.5 (dimless)
 
     ! Finding theta_L based on equations (1) and (5)
     C_L = Cbar_L * NA
@@ -408,7 +413,8 @@ subroutine UMATHT(u,dudt,dudg,flux,dfdt,dfdg, &
         N_trap = (sqrt(2.0)/lattice_a) * rho_d 
         Nbar_trap = N_trap / NA
         ! Equation 17: relationship between Nbar and PEEQ
-        dNbar_trap_dPEEQ = (sqrt(2.0) / a_lattice * gamma) / NA ! = 1.414 / 2.86 * 10^(-10) * 2 * 10^16 / 6.023 * 10^23
+        ! = 1.414 / 2.86 * 10^(-10) * 2 * 10^16 / 6.023 * 10^23 = 164.197
+        dNbar_trap_dPEEQ = gamma * (sqrt(2.0) / a_lattice) / NA 
     else
         rho_d = 10D16 ! Equation 36
         N_trap = (sqrt(2.0)/lattice_a) * rho_d
@@ -421,13 +427,14 @@ subroutine UMATHT(u,dudt,dudg,flux,dfdt,dfdg, &
     
     ! Equation 4: obtain C_trap
     C_trap = 1 * theta_trap * N_trap
+
     ! Equation 6: obtain Cbar_trap
     Cbar_trap = C_trap / NA
 
     ! Equation (23) The 1st equation to update dudt (partial_Cbar_total_partial_Cbar_L)
     dudt = 1 + (beta * Nbar_trap * K * Nbar_L) / ((beta * Nbar_L + K * Cbar_L) ** 2)
     
-    ! Equation (23) The 2nd equation to update dudg (partial_Cbar_total_partial_Nbar_trap)
+    ! Equation (23) The 2nd equation to update dudtrap (partial_Cbar_total_partial_Nbar_trap)
     dudtrap = (K * Cbar_L) / (K * Cbar_L + beta * Nbar_L)
 
     ! Equation (22) The total hydrogen diffusion equation to update u 
@@ -437,6 +444,7 @@ subroutine UMATHT(u,dudt,dudg,flux,dfdt,dfdg, &
     
     u = u + dudt * dtemp + dudtrap * dNbar_trap_dPEEQ * dPEEQ
     Cbar_total = u
+    
     ! Since the problem is 2-dimensional, ntgrd = 2
     ! ntgrd: Number of spatial gradients of temperature
 
